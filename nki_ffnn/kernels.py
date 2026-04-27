@@ -22,7 +22,18 @@ def nki_transpose(in_tensor):
 
     out_tensor = nl.ndarray((o_rows, o_cols), dtype=in_tensor.dtype, buffer=nl.hbm)
 
-    # YOUR CODE HERE
+    # max partition dimension.. left most dimensino = partition dimensino
+    TILE = nl.tile_size.pmax # is it just 128?
+    # setting the tile
+    tile = nl.mgrid[0:TILE, 0:TILE]
+    # sequence of nums for parallel loop iterators
+    # Use affine_range to loop over tiles
+    for m in nl.affine_range(i_rows// TILE):
+      for n in nl.affine_range(i_cols// TILE):
+        # load and transpose of tile
+        transpose = nl.load_transpose2d(in_tensor[m * TILE + tile.p, n*TILE + tile.x])
+        # store it back to out_tensor
+        nl.store(out_tensor[n * TILE + tile.p, m * TILE + tile.x], value=transpose)
 
     return out_tensor
 
@@ -45,7 +56,37 @@ def nki_bias_add_act(A, b, act='relu'):
     # Create an output tensor
     result = nl.ndarray((BATCH_SIZE, HIDDEN_SIZE), dtype=A.dtype, buffer=nl.hbm)
 
-    # YOUR CODE HERE
+    # folloiwng matmul kernels convention
+    TILE_M = nl.tile_size.pmax
+    idx = nl.mgrid[0:TILE_M, 0:HIDDEN_SIZE] 
+    r = idx.p
+    c = idx.x
+
+    for i in nl.affine_range(BATCH_SIZE// TILE_M):
+      A_tile = nl.load(A[i * TILE_M + r, c])
+      b_tile = nl.load(b[0, c])
+
+      z = A_tile + b_tile
+
+      # if activation is relu: 
+      # return np.maximum(0, x) 
+      if act == 'relu':
+          out = nl.maximum(z, 0)
+
+      # if softmax:
+      # e_x = np.exp(x - np.max(x, axis=1, keepdims=True))
+      # then e_x / np.sum(e_x, axis=1, keepdims=True)
+      elif act == 'softmax':
+          row_max = nl.max(z, axis=1)
+          shift = z - row_max # our actual exp shift
+          exp_z = nl.exp(shift)
+          row_sum = nl.sum(exp_z, axis=1) 
+          out = exp_z / row_sum
+
+      else:
+          out = z
+
+      nl.store(result[i * TILE_M + r, c], value=out)
 
     return result
 
@@ -85,10 +126,19 @@ def nki_forward(
     raise ValueError(f"Unsupported matmul kernel: {matmul_kernel}")
 
   # Layer 1
-  # YOUR CODE HERE  
+  #  self.z1 = X @ self.W1 + self.b1
+  #  self.a1 = relu(self.z1)
+  XT = nki_transpose(X) # transpose X for matmul (lhsT should alr be tarnsposed)
+  z1 = nki_matmul(XT, W1)
+  a1 = nki_bias_add_act(z1, b1, act='relu')
 
   # Layer 2 (output)
-  # YOUR CODE HERE
+  #  self.z2 = self.a1 @ self.W2 + self.b2
+  # self.a2 = softmax(self.z2)
+  # essentially: take result a1 @ W2 + b2, then call softmax
+  a1T = nki_transpose(a1) 
+  z2 = nki_matmul(a1T, W2)
+  probs = nki_bias_add_act(z2, b2, act='softmax')
 
   return probs
 
@@ -120,10 +170,31 @@ def nki_predict(
   Returns:
       predictions: a 1D tensor of shape [BATCH_SIZE] with the predicted class for each input
   """
-  probs = # YOUR CODE HERE
+  # probs = self.forward(X) 
+  probs = nki_forward(X, W1, b1, W2, b2, matmul_kernel)
   BATCH_SIZE, OUTPUT_SIZE = probs.shape
   predictions = nl.ndarray((BATCH_SIZE,), dtype=np.int32, buffer=nl.hbm)
 
-  # YOUR CODE HERE
+  # return np.argmax(probs, axis=1).astype(np.int32)- can't use actual argmax
+  # aka: return the max of of all of these rows
+  TILE_M = nl.tile_size.pmax
+  idx = nl.mgrid[0:TILE_M, 0:OUTPUT_SIZE]
+  r = idx.p
+  c = idx.x
+
+  idx8 = nl.mgrid[0:TILE_M, 0:8]
+  r8 = idx8.p
+
+  for i in nl.affine_range(BATCH_SIZE // TILE_M):
+      # loads a block of rows and output columns
+      probs_tile = nl.load(probs[i * TILE_M + r, c])
+      # finds top 8 values per row: (Find the 8 largest values in each partition of the source tile.)
+      vals = nisa.max8(src=probs_tile)
+      # gets index of these vals..  (Find indices of the 8 given vals in each partition of the data tensor.)
+      inds = nisa.nc_find_index8(data=probs_tile, vals=vals)
+     
+      # store predictions- first column. of info (largest)
+      pred = nl.copy(inds[r8, 0], dtype=np.int32)
+      nl.store(predictions[i * TILE_M + r8], value=pred)
 
   return predictions
